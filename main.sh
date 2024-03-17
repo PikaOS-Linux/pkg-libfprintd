@@ -3,7 +3,7 @@
 DEBIAN_FRONTEND=noninteractive
 
 # Clone Upstream
-git clone -b v1.94.7 https://gitlab.freedesktop.org/libfprint/libfprint ./libfprintd-2-2
+git clone -b egismoc-0587 https://gitlab.freedesktop.org/thameruddin/libfprint ./libfprintd-2-2
 cp -rvf ./debian ./libfprintd-2-2/
 cd ./libfprintd-2-2/
 
