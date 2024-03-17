@@ -1,5 +1,5 @@
-upstream-name (pkgver-pkgrel) distro_codename; urgency=medium
+libfprint (1:1.94.7-100pika1) pikauwu; urgency=medium
 
-  * Initial release. (Closes: #nnnn)  <nnnn is the bug number of your ITP>
+  * New upstream release
 
- -- ferreo <harderthanfire@gmail.com>  Wed, 18 Jan 2023 21:48:14 +0000
+ -- Marco Trevisan (Treviño) <marco@ubuntu.com>  Wed, 23 Aug 2023 01:11:51 +0200

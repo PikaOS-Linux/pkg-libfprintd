@@ -3,9 +3,11 @@
 DEBIAN_FRONTEND=noninteractive
 
 # Clone Upstream
-mkdir -p ./src-pkg-name
-cp -rvf ./debian ./src-pkg-name/
-cd ./src-pkg-name/
+git clone -b v1.94.7 https://gitlab.freedesktop.org/libfprint/libfprint ./libfprintd-2-2
+cp -rvf ./debian ./libfprintd-2-2/
+cd ./libfprintd-2-2/
+
+for i in $(cat ../patches/series | grep -v '^#') ; do echo "Applying Patch: $i" && patch -Np1 -i ../patches/$i || bash -c "echo "Applying Patch $i Failed!" && exit 2"; done
 
 # Get build deps
 apt-get build-dep ./ -y

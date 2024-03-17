@@ -1,0 +1,1002 @@
+From d6334a7a4ce57092d426c5016aed286c61b3bffb Mon Sep 17 00:00:00 2001
+From: Tamer Hassan <thameruddin@gmail.com>
+Date: Sat, 9 Mar 2024 12:20:15 +0400
+Subject: [PATCH] egismoc: add 0587 support (also supports 0586 but missing
+ device file)
+
+---
+ data/autosuspend.hwdb               |   1 +
+ libfprint/drivers/egismoc/egismoc.c |  80 ++++++++-
+ libfprint/drivers/egismoc/egismoc.h |   7 +-
+ tests/egismoc-0587/custom.pcapng    | Bin 0 -> 92988 bytes
+ tests/egismoc-0587/custom.py        | 156 ++++++++++++++++
+ tests/egismoc-0587/device           | 270 ++++++++++++++++++++++++++++
+ tests/meson.build                   |   1 +
+ 7 files changed, 508 insertions(+), 7 deletions(-)
+ create mode 100644 tests/egismoc-0587/custom.pcapng
+ create mode 100755 tests/egismoc-0587/custom.py
+ create mode 100644 tests/egismoc-0587/device
+
+diff --git a/data/autosuspend.hwdb b/data/autosuspend.hwdb
+index 74ac65b0..d8a112b0 100644
+--- a/data/autosuspend.hwdb
++++ b/data/autosuspend.hwdb
+@@ -79,6 +79,7 @@ usb:v1C7Ap0571*
+ 
+ # Supported by libfprint driver egismoc
+ usb:v1C7Ap0582*
++usb:v1C7Ap0587*
+ usb:v1C7Ap05A1*
+  ID_AUTOSUSPEND=1
+  ID_PERSIST=0
+diff --git a/libfprint/drivers/egismoc/egismoc.c b/libfprint/drivers/egismoc/egismoc.c
+index 336ea53c..97997a2d 100644
+--- a/libfprint/drivers/egismoc/egismoc.c
++++ b/libfprint/drivers/egismoc/egismoc.c
+@@ -43,14 +43,20 @@ struct _FpiDeviceEgisMoc
+   FpiSsm         *cmd_ssm;
+   FpiUsbTransfer *cmd_transfer;
+   GCancellable   *interrupt_cancellable;
+-
+   GPtrArray      *enrolled_ids;
++  gint            max_enroll_stages;
+ };
+ 
+ G_DEFINE_TYPE (FpiDeviceEgisMoc, fpi_device_egismoc, FP_TYPE_DEVICE);
+ 
+ static const FpIdEntry egismoc_id_table[] = {
+   { .vid = 0x1c7a, .pid = 0x0582, .driver_data = EGISMOC_DRIVER_CHECK_PREFIX_TYPE1 },
++  /*
++   * 0x0586 is supported in the same way as 0587 per user report, but missing submission of device file to be included
++   *
++   * { .vid = 0x1c7a, .pid = 0x0586, .driver_data = EGISMOC_DRIVER_CHECK_PREFIX_TYPE1 | EGISMOC_DRIVER_MAX_ENROLL_STAGES_20 },
++   */
++  { .vid = 0x1c7a, .pid = 0x0587, .driver_data = EGISMOC_DRIVER_CHECK_PREFIX_TYPE1 | EGISMOC_DRIVER_MAX_ENROLL_STAGES_20 },
+   { .vid = 0x1c7a, .pid = 0x05a1, .driver_data = EGISMOC_DRIVER_CHECK_PREFIX_TYPE2 },
+   { .vid = 0,      .pid = 0,      .driver_data = 0 }
+ };
+@@ -769,7 +775,7 @@ egismoc_enroll_status_report (FpDevice    *device,
+       enroll_print->stage++;
+       fp_info ("Partial capture successful. Please touch the sensor again (%d/%d)",
+                enroll_print->stage,
+-               EGISMOC_MAX_ENROLL_NUM);
++               self->max_enroll_stages);
+       fpi_device_enroll_progress (device, enroll_print->stage, enroll_print->print, NULL);
+       break;
+ 
+@@ -849,7 +855,7 @@ egismoc_read_capture_cb (FpDevice *device,
+       egismoc_enroll_status_report (device, enroll_print, ENROLL_STATUS_RETRY, error);
+     }
+ 
+-  if (enroll_print->stage == EGISMOC_ENROLL_TIMES)
++  if (enroll_print->stage == self->max_enroll_stages)
+     fpi_ssm_next_state (self->task_ssm);
+   else
+     fpi_ssm_jump_to_state (self->task_ssm, ENROLL_CAPTURE_SENSOR_RESET);
+@@ -1460,6 +1466,71 @@ egismoc_dev_init_handler (FpiSsm   *ssm,
+                            NULL);
+ }
+ 
++static void
++egismoc_probe (FpDevice *device)
++{
++  GUsbDevice *usb_dev;
++  GError *error = NULL;
++  g_autofree gchar *serial = NULL;
++  FpiDeviceEgisMoc *self = FPI_DEVICE_EGISMOC (device);
++
++  fp_dbg ("%s enter --> ", G_STRFUNC);
++
++  /* Claim usb interface */
++  usb_dev = fpi_device_get_usb_device (device);
++  if (!g_usb_device_open (usb_dev, &error))
++    {
++      fp_dbg ("%s g_usb_device_open failed %s", G_STRFUNC, error->message);
++      fpi_device_probe_complete (device, NULL, NULL, error);
++      return;
++    }
++
++  if (!g_usb_device_reset (usb_dev, &error))
++    {
++      fp_dbg ("%s g_usb_device_reset failed %s", G_STRFUNC, error->message);
++      g_usb_device_close (usb_dev, NULL);
++      fpi_device_probe_complete (device, NULL, NULL, error);
++      return;
++    }
++
++  if (!g_usb_device_claim_interface (usb_dev, 0, 0, &error))
++    {
++      fp_dbg ("%s g_usb_device_claim_interface failed %s", G_STRFUNC, error->message);
++      g_usb_device_close (usb_dev, NULL);
++      fpi_device_probe_complete (device, NULL, NULL, error);
++      return;
++    }
++
++  if (g_strcmp0 (g_getenv ("FP_DEVICE_EMULATION"), "1") == 0)
++    serial = g_strdup ("emulated-device");
++  else
++    serial = g_usb_device_get_string_descriptor (usb_dev,
++                                                 g_usb_device_get_serial_number_index (usb_dev),
++                                                 &error);
++
++  if (error)
++    {
++      fp_dbg ("%s g_usb_device_get_string_descriptor failed %s", G_STRFUNC, error->message);
++      g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (device)),
++                                      0, 0, NULL);
++      g_usb_device_close (usb_dev, NULL);
++      fpi_device_probe_complete (device, NULL, NULL, error);
++      return;
++    }
++
++  if (fpi_device_get_driver_data (device) & EGISMOC_DRIVER_MAX_ENROLL_STAGES_20)
++    self->max_enroll_stages = 20;
++  else
++    self->max_enroll_stages = EGISMOC_MAX_ENROLL_STAGES_DEFAULT;
++
++  fpi_device_set_nr_enroll_stages (device, self->max_enroll_stages);
++
++  g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (device)), 0, 0, NULL);
++  g_usb_device_close (usb_dev, NULL);
++
++  fpi_device_probe_complete (device, serial, NULL, error);
++}
++
+ static void
+ egismoc_open (FpDevice *device)
+ {
+@@ -1540,10 +1611,11 @@ fpi_device_egismoc_class_init (FpiDeviceEgisMocClass *klass)
+   dev_class->type = FP_DEVICE_TYPE_USB;
+   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+   dev_class->id_table = egismoc_id_table;
+-  dev_class->nr_enroll_stages = EGISMOC_ENROLL_TIMES;
++  dev_class->nr_enroll_stages = EGISMOC_MAX_ENROLL_STAGES_DEFAULT;
+   /* device should be "always off" unless being used */
+   dev_class->temp_hot_seconds = 0;
+ 
++  dev_class->probe = egismoc_probe;
+   dev_class->open = egismoc_open;
+   dev_class->cancel = egismoc_cancel;
+   dev_class->suspend = egismoc_suspend;
+diff --git a/libfprint/drivers/egismoc/egismoc.h b/libfprint/drivers/egismoc/egismoc.h
+index f027ea23..ef31d2cd 100644
+--- a/libfprint/drivers/egismoc/egismoc.h
++++ b/libfprint/drivers/egismoc/egismoc.h
+@@ -36,6 +36,7 @@ G_DECLARE_FINAL_TYPE (FpiDeviceEgisMoc, fpi_device_egismoc, FPI, DEVICE_EGISMOC,
+ 
+ #define EGISMOC_DRIVER_CHECK_PREFIX_TYPE1 (1 << 0)
+ #define EGISMOC_DRIVER_CHECK_PREFIX_TYPE2 (1 << 1)
++#define EGISMOC_DRIVER_MAX_ENROLL_STAGES_20 (1 << 2)
+ 
+ #define EGISMOC_EP_CMD_OUT (0x02 | FPI_USB_ENDPOINT_OUT)
+ #define EGISMOC_EP_CMD_IN (0x81 | FPI_USB_ENDPOINT_IN)
+@@ -49,7 +50,7 @@ G_DECLARE_FINAL_TYPE (FpiDeviceEgisMoc, fpi_device_egismoc, FPI, DEVICE_EGISMOC,
+ #define EGISMOC_USB_IN_RECV_LENGTH 4096
+ #define EGISMOC_USB_INTERRUPT_IN_RECV_LENGTH 64
+ 
+-#define EGISMOC_ENROLL_TIMES 10
++#define EGISMOC_MAX_ENROLL_STAGES_DEFAULT 10
+ #define EGISMOC_MAX_ENROLL_NUM 10
+ #define EGISMOC_FINGERPRINT_DATA_SIZE 32
+ #define EGISMOC_LIST_RESPONSE_PREFIX_SIZE 14
+@@ -100,11 +101,11 @@ static guchar cmd_read_capture[] = {0x00, 0x00, 0x00, 0x07, 0x50, 0x16, 0x02, 0x
+ static gsize cmd_read_capture_len = sizeof (cmd_read_capture) / sizeof (cmd_read_capture[0]);
+ static guchar rsp_read_success_prefix[] = {0x00, 0x00, 0x00, 0x04};
+ static gsize rsp_read_success_prefix_len = sizeof (rsp_read_success_prefix) / sizeof (rsp_read_success_prefix[0]);
+-static guchar rsp_read_success_suffix[] = {0x0a, 0x90, 0x00};
++static guchar rsp_read_success_suffix[] = {0x90, 0x00};
+ static gsize rsp_read_success_suffix_len = sizeof (rsp_read_success_suffix) / sizeof (rsp_read_success_suffix[0]);
+ static guchar rsp_read_offcenter_prefix[] = {0x00, 0x00, 0x00, 0x04};
+ static gsize rsp_read_offcenter_prefix_len = sizeof (rsp_read_offcenter_prefix) / sizeof (rsp_read_offcenter_prefix[0]);
+-static guchar rsp_read_offcenter_suffix[] = {0x0a, 0x64, 0x91};
++static guchar rsp_read_offcenter_suffix[] = {0x64, 0x91};
+ static gsize rsp_read_offcenter_suffix_len = sizeof (rsp_read_offcenter_suffix) / sizeof (rsp_read_offcenter_suffix[0]);
+ static guchar rsp_read_dirty_prefix[] = {0x00, 0x00, 0x00, 0x02, 0x64};
+ static gsize rsp_read_dirty_prefix_len = sizeof (rsp_read_dirty_prefix) / sizeof (rsp_read_dirty_prefix[0]);
+diff --git a/tests/egismoc-0587/custom.pcapng b/tests/egismoc-0587/custom.pcapng
+new file mode 100644
+index 0000000000000000000000000000000000000000..c721929c2e46976dceaf808a77f9e30df486a586
+GIT binary patch
+literal 92988
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/egismoc-0587/custom.py b/tests/egismoc-0587/custom.py
+new file mode 100755
+index 00000000..3a662380
+--- /dev/null
++++ b/tests/egismoc-0587/custom.py
+@@ -0,0 +1,156 @@
++#!/usr/bin/python3
++
++import traceback
++import sys
++import time
++import gi
++
++gi.require_version('FPrint', '2.0')
++from gi.repository import FPrint, GLib
++
++# Exit with error on any exception, included those happening in async callbacks
++sys.excepthook = lambda *args: (traceback.print_exception(*args), sys.exit(1))
++
++ctx = GLib.main_context_default()
++
++c = FPrint.Context()
++c.enumerate()
++devices = c.get_devices()
++
++d = devices[0]
++del devices
++
++d.open_sync()
++
++assert d.get_driver() == "egismoc"
++assert not d.has_feature(FPrint.DeviceFeature.CAPTURE)
++assert d.has_feature(FPrint.DeviceFeature.IDENTIFY)
++assert d.has_feature(FPrint.DeviceFeature.VERIFY)
++assert d.has_feature(FPrint.DeviceFeature.DUPLICATES_CHECK)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE_LIST)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE_DELETE)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE_CLEAR)
++
++def enroll_progress(*args):
++    print("finger status: ", d.get_finger_status())
++    print('enroll progress: ' + str(args))
++
++def identify_done(dev, res):
++    global identified
++    identified = True
++    identify_match, identify_print = dev.identify_finish(res)
++    print('indentification_done: ', identify_match, identify_print)
++    assert identify_match.equal(identify_print)
++
++# Beginning with list and clear assumes you begin with >0 prints enrolled before capturing
++
++print("listing - device should have prints")
++stored = d.list_prints_sync()
++assert len(stored) > 0
++del stored
++
++print("clear device storage")
++d.clear_storage_sync()
++print("clear done")
++
++print("listing - device should be empty")
++stored = d.list_prints_sync()
++assert len(stored) == 0
++del stored
++
++print("enrolling")
++template = FPrint.Print.new(d)
++template.set_finger(FPrint.Finger.LEFT_INDEX)
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++p1 = d.enroll_sync(template, None, enroll_progress, None)
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++print("enroll done")
++del template
++
++print("listing - device should have 1 print")
++stored = d.list_prints_sync()
++assert len(stored) == 1
++assert stored[0].equal(p1)
++
++print("verifying")
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++verify_res, verify_print = d.verify_sync(p1)
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++print("verify done")
++assert verify_res == True
++
++identified = False
++deserialized_prints = []
++for p in stored:
++    deserialized_prints.append(FPrint.Print.deserialize(p.serialize()))
++    assert deserialized_prints[-1].equal(p)
++del stored
++
++print('async identifying')
++d.identify(deserialized_prints, callback=identify_done)
++del deserialized_prints
++
++while not identified:
++    ctx.iteration(True)
++
++print("try to enroll duplicate")
++template = FPrint.Print.new(d)
++template.set_finger(FPrint.Finger.RIGHT_INDEX)
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++try:
++    d.enroll_sync(template, None, enroll_progress, None)
++except GLib.Error as error:
++    assert error.matches(FPrint.DeviceError.quark(),
++                         FPrint.DeviceError.DATA_DUPLICATE)
++except Exception as exc:
++    raise
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++print("duplicate enroll attempt done")
++
++print("listing - device should still only have 1 print")
++stored = d.list_prints_sync()
++assert len(stored) == 1
++assert stored[0].equal(p1)
++del stored
++
++print("enroll new finger")
++template = FPrint.Print.new(d)
++template.set_finger(FPrint.Finger.RIGHT_INDEX)
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++p2 = d.enroll_sync(template, None, enroll_progress, None)
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++print("enroll new finger done")
++del template
++
++print("listing - device should have 2 prints")
++stored = d.list_prints_sync()
++assert len(stored) == 2
++assert (stored[0].equal(p1) and stored[1].equal(p2)) or (stored[0].equal(p2) and stored[1].equal(p1))
++del stored
++
++print("deleting first print")
++d.delete_print_sync(p1)
++print("delete done")
++del p1
++
++print("listing - device should only have second print")
++stored = d.list_prints_sync()
++assert len(stored) == 1
++assert stored[0].equal(p2)
++del stored
++del p2
++
++print("clear device storage")
++d.clear_storage_sync()
++print("clear done")
++
++print("listing - device should be empty")
++stored = d.list_prints_sync()
++assert len(stored) == 0
++del stored
++
++d.close_sync()
++
++del d
++del c
+diff --git a/tests/egismoc-0587/device b/tests/egismoc-0587/device
+new file mode 100644
+index 00000000..91744df1
+--- /dev/null
++++ b/tests/egismoc-0587/device
+@@ -0,0 +1,270 @@
++P: /devices/pci0000:00/0000:00:14.0/usb3/3-5
++N: bus/usb/003/009=12010002FF0000407A1C870567640102030109022700010100A0320904000003FF000000070581020002000705020200020007058303400005
++E: BUSNUM=003
++E: DEVNAME=/dev/bus/usb/003/009
++E: DEVNUM=009
++E: DEVTYPE=usb_device
++E: DRIVER=usb
++E: ID_AUTOSUSPEND=1
++E: ID_BUS=usb
++E: ID_MODEL=ETU905A88-E
++E: ID_MODEL_ENC=ETU905A88-E
++E: ID_MODEL_ID=0587
++E: ID_PATH=pci-0000:00:14.0-usb-0:5
++E: ID_PATH_TAG=pci-0000_00_14_0-usb-0_5
++E: ID_PATH_WITH_USB_REVISION=pci-0000:00:14.0-usbv2-0:5
++E: ID_PERSIST=0
++E: ID_REVISION=6467
++E: ID_SERIAL=EGIS_ETU905A88-E_198427PCU834
++E: ID_SERIAL_SHORT=198427PCU834
++E: ID_USB_INTERFACES=:ff0000:
++E: ID_USB_MODEL=ETU905A88-E
++E: ID_USB_MODEL_ENC=ETU905A88-E
++E: ID_USB_MODEL_ID=0587
++E: ID_USB_REVISION=6467
++E: ID_USB_SERIAL=EGIS_ETU905A88-E_198427PCU834
++E: ID_USB_SERIAL_SHORT=198427PCU834
++E: ID_USB_VENDOR=EGIS
++E: ID_USB_VENDOR_ENC=EGIS
++E: ID_USB_VENDOR_ID=1c7a
++E: ID_VENDOR=EGIS
++E: ID_VENDOR_ENC=EGIS
++E: ID_VENDOR_FROM_DATABASE=LighTuning Technology Inc.
++E: ID_VENDOR_ID=1c7a
++E: MAJOR=189
++E: MINOR=264
++E: PRODUCT=1c7a/587/6467
++E: SUBSYSTEM=usb
++E: TYPE=255/0/0
++A: authorized=1\n
++A: avoid_reset_quirk=0\n
++A: bConfigurationValue=1\n
++A: bDeviceClass=ff\n
++A: bDeviceProtocol=00\n
++A: bDeviceSubClass=00\n
++A: bMaxPacketSize0=64\n
++A: bMaxPower=100mA\n
++A: bNumConfigurations=1\n
++A: bNumInterfaces= 1\n
++A: bcdDevice=6467\n
++A: bmAttributes=a0\n
++A: busnum=3\n
++A: configuration=
++H: descriptors=12010002FF0000407A1C870567640102030109022700010100A0320904000003FF000000070581020002000705020200020007058303400005
++A: dev=189:264\n
++A: devnum=9\n
++A: devpath=5\n
++L: driver=../../../../../bus/usb/drivers/usb
++L: firmware_node=../../../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:4e/device:4f/device:54
++A: idProduct=0587\n
++A: idVendor=1c7a\n
++A: ltm_capable=no\n
++A: manufacturer=EGIS\n
++A: maxchild=0\n
++A: physical_location/dock=no\n
++A: physical_location/horizontal_position=left\n
++A: physical_location/lid=no\n
++A: physical_location/panel=top\n
++A: physical_location/vertical_position=upper\n
++L: port=../3-0:1.0/usb3-port5
++A: power/active_duration=58096\n
++A: power/async=enabled\n
++A: power/autosuspend=2\n
++A: power/autosuspend_delay_ms=2000\n
++A: power/connected_duration=183928\n
++A: power/control=auto\n
++A: power/level=auto\n
++A: power/persist=0\n
++A: power/runtime_active_kids=0\n
++A: power/runtime_active_time=58510\n
++A: power/runtime_enabled=enabled\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=125136\n
++A: power/runtime_usage=0\n
++A: power/wakeup=disabled\n
++A: power/wakeup_abort_count=\n
++A: power/wakeup_active=\n
++A: power/wakeup_active_count=\n
++A: power/wakeup_count=\n
++A: power/wakeup_expire_count=\n
++A: power/wakeup_last_time_ms=\n
++A: power/wakeup_max_time_ms=\n
++A: power/wakeup_total_time_ms=\n
++A: product=ETU905A88-E\n
++A: quirks=0x0\n
++A: removable=fixed\n
++A: rx_lanes=1\n
++A: serial=198427PCU834\n
++A: speed=480\n
++A: tx_lanes=1\n
++A: urbnum=547\n
++A: version= 2.00\n
++
++P: /devices/pci0000:00/0000:00:14.0/usb3
++N: bus/usb/003/001=12010002090001406B1D020006060302010109021900010100E0000904000001090000000705810304000C
++E: BUSNUM=003
++E: CURRENT_TAGS=:seat:
++E: DEVNAME=/dev/bus/usb/003/001
++E: DEVNUM=001
++E: DEVTYPE=usb_device
++E: DRIVER=usb
++E: ID_AUTOSUSPEND=1
++E: ID_BUS=usb
++E: ID_FOR_SEAT=usb-pci-0000_00_14_0
++E: ID_MODEL=xHCI_Host_Controller
++E: ID_MODEL_ENC=xHCI\x20Host\x20Controller
++E: ID_MODEL_FROM_DATABASE=2.0 root hub
++E: ID_MODEL_ID=0002
++E: ID_PATH=pci-0000:00:14.0
++E: ID_PATH_TAG=pci-0000_00_14_0
++E: ID_REVISION=0606
++E: ID_SERIAL=Linux_6.6.0-14-generic_xhci-hcd_xHCI_Host_Controller_0000:00:14.0
++E: ID_SERIAL_SHORT=0000:00:14.0
++E: ID_USB_INTERFACES=:090000:
++E: ID_USB_MODEL=xHCI_Host_Controller
++E: ID_USB_MODEL_ENC=xHCI\x20Host\x20Controller
++E: ID_USB_MODEL_ID=0002
++E: ID_USB_REVISION=0606
++E: ID_USB_SERIAL=Linux_6.6.0-14-generic_xhci-hcd_xHCI_Host_Controller_0000:00:14.0
++E: ID_USB_SERIAL_SHORT=0000:00:14.0
++E: ID_USB_VENDOR=Linux_6.6.0-14-generic_xhci-hcd
++E: ID_USB_VENDOR_ENC=Linux\x206.6.0-14-generic\x20xhci-hcd
++E: ID_USB_VENDOR_ID=1d6b
++E: ID_VENDOR=Linux_6.6.0-14-generic_xhci-hcd
++E: ID_VENDOR_ENC=Linux\x206.6.0-14-generic\x20xhci-hcd
++E: ID_VENDOR_FROM_DATABASE=Linux Foundation
++E: ID_VENDOR_ID=1d6b
++E: MAJOR=189
++E: MINOR=256
++E: PRODUCT=1d6b/2/606
++E: SUBSYSTEM=usb
++E: TAGS=:seat:
++E: TYPE=9/0/1
++A: authorized=1\n
++A: authorized_default=1\n
++A: avoid_reset_quirk=0\n
++A: bConfigurationValue=1\n
++A: bDeviceClass=09\n
++A: bDeviceProtocol=01\n
++A: bDeviceSubClass=00\n
++A: bMaxPacketSize0=64\n
++A: bMaxPower=0mA\n
++A: bNumConfigurations=1\n
++A: bNumInterfaces= 1\n
++A: bcdDevice=0606\n
++A: bmAttributes=e0\n
++A: busnum=3\n
++A: configuration=
++H: descriptors=12010002090001406B1D020006060302010109021900010100E0000904000001090000000705810304000C
++A: dev=189:256\n
++A: devnum=1\n
++A: devpath=0\n
++L: driver=../../../../bus/usb/drivers/usb
++L: firmware_node=../../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:4e/device:4f
++A: idProduct=0002\n
++A: idVendor=1d6b\n
++A: interface_authorized_default=1\n
++A: ltm_capable=no\n
++A: manufacturer=Linux 6.6.0-14-generic xhci-hcd\n
++A: maxchild=12\n
++A: power/active_duration=5145268\n
++A: power/async=enabled\n
++A: power/autosuspend=0\n
++A: power/autosuspend_delay_ms=0\n
++A: power/connected_duration=5191200\n
++A: power/control=auto\n
++A: power/level=auto\n
++A: power/runtime_active_kids=2\n
++A: power/runtime_active_time=5145262\n
++A: power/runtime_enabled=enabled\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=45937\n
++A: power/runtime_usage=0\n
++A: power/wakeup=disabled\n
++A: power/wakeup_abort_count=\n
++A: power/wakeup_active=\n
++A: power/wakeup_active_count=\n
++A: power/wakeup_count=\n
++A: power/wakeup_expire_count=\n
++A: power/wakeup_last_time_ms=\n
++A: power/wakeup_max_time_ms=\n
++A: power/wakeup_total_time_ms=\n
++A: product=xHCI Host Controller\n
++A: quirks=0x0\n
++A: removable=unknown\n
++A: rx_lanes=1\n
++A: serial=0000:00:14.0\n
++A: speed=480\n
++A: tx_lanes=1\n
++A: urbnum=637\n
++A: version= 2.00\n
++
++P: /devices/pci0000:00/0000:00:14.0
++E: DRIVER=xhci_hcd
++E: ID_AUTOSUSPEND=1
++E: ID_MODEL_FROM_DATABASE=Alder Lake PCH USB 3.2 xHCI Host Controller
++E: ID_PATH=pci-0000:00:14.0
++E: ID_PATH_TAG=pci-0000_00_14_0
++E: ID_PCI_CLASS_FROM_DATABASE=Serial bus controller
++E: ID_PCI_INTERFACE_FROM_DATABASE=XHCI
++E: ID_PCI_SUBCLASS_FROM_DATABASE=USB controller
++E: ID_VENDOR_FROM_DATABASE=Intel Corporation
++E: MODALIAS=pci:v00008086d000051EDsv00001043sd0000201Fbc0Csc03i30
++E: PCI_CLASS=C0330
++E: PCI_ID=8086:51ED
++E: PCI_SLOT_NAME=0000:00:14.0
++E: PCI_SUBSYS_ID=1043:201F
++E: SUBSYSTEM=pci
++A: ari_enabled=0\n
++A: broken_parity_status=0\n
++A: class=0x0c0330\n
++H: config=8680ED51060490020130030C000080000400262F62000000000000000000000000000000000000000000000043101F20000000007000000000000000FF010000FD0134A089C27F8000000000000000003F6DD80F000000000000000000000000316000000000000000000000000000000180C2C1080000000000000000000000059087001805E0FE000000000000000009B014F01000400100000000C10A080000080E00001800008F50020000010000090000018680C00009001014000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000B50F110112000000
++A: consistent_dma_mask_bits=64\n
++A: d3cold_allowed=1\n
++A: dbc=disabled\n
++A: dbc_bInterfaceProtocol=01\n
++A: dbc_bcdDevice=0010\n
++A: dbc_idProduct=0010\n
++A: dbc_idVendor=1d6b\n
++A: device=0x51ed\n
++A: dma_mask_bits=64\n
++L: driver=../../../bus/pci/drivers/xhci_hcd
++A: driver_override=(null)\n
++A: enable=1\n
++L: firmware_node=../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:4e
++A: index=10\n
++L: iommu=../../virtual/iommu/dmar1
++L: iommu_group=../../../kernel/iommu_groups/11
++A: irq=145\n
++A: label=Onboard - Other\n
++A: local_cpulist=0-19\n
++A: local_cpus=fffff\n
++A: modalias=pci:v00008086d000051EDsv00001043sd0000201Fbc0Csc03i30\n
++A: msi_bus=1\n
++A: msi_irqs/145=msi\n
++A: numa_node=-1\n
++A: pools=poolinfo - 0.1\nbuffer-2048         0    0 2048  0\nbuffer-512          0    0  512  0\nbuffer-128          1   32  128  1\nbuffer-32           0    0   32  0\nxHCI 1KB stream ctx arrays    0    0 1024  0\nxHCI 256 byte stream ctx arrays    0    0  256  0\nxHCI input/output contexts   10   11 2112 11\nxHCI ring segments   38   38 4096 38\nbuffer-2048         0    0 2048  0\nbuffer-512          0    0  512  0\nbuffer-128          6   32  128  1\nbuffer-32           0    0   32  0\n
++A: power/async=enabled\n
++A: power/control=auto\n
++A: power/runtime_active_kids=2\n
++A: power/runtime_active_time=5192072\n
++A: power/runtime_enabled=enabled\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=0\n
++A: power/runtime_usage=0\n
++A: power/wakeup=enabled\n
++A: power/wakeup_abort_count=0\n
++A: power/wakeup_active=0\n
++A: power/wakeup_active_count=0\n
++A: power/wakeup_count=0\n
++A: power/wakeup_expire_count=0\n
++A: power/wakeup_last_time_ms=0\n
++A: power/wakeup_max_time_ms=0\n
++A: power/wakeup_total_time_ms=0\n
++A: power_state=D0\n
++A: resource=0x000000622f260000 0x000000622f26ffff 0x0000000000140204\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n
++A: revision=0x01\n
++A: subsystem_device=0x201f\n
++A: subsystem_vendor=0x1043\n
++A: vendor=0x8086\n
++
+diff --git a/tests/meson.build b/tests/meson.build
+index dc3b70e2..7a7afc03 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -53,6 +53,7 @@ drivers_tests = [
+     'egis0570',
+     'egismoc',
+     'egismoc-05a1',
++    'egismoc-0587',
+     'fpcmoc',
+     'realtek',
+     'focaltech_moc',
+-- 
+GitLab
+
